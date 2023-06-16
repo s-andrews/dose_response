@@ -1,0 +1,230 @@
+---
+title: "Dose Response Curve"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: true
+---
+
+This is an example of fitting a dose response curve in R.
+
+Load Data
+=========
+
+```{r message=FALSE}
+library(drc)
+library(tidyverse)
+library(broom)
+theme_set(theme_bw())
+
+read_delim("drc.txt") -> drc
+
+drc
+```
+
+We have 11 doses of 6 samples, 3 each of control and experiment.
+
+
+Restructure
+-----------
+
+The data isn't in tidy format at the moment so let's restructure it so it's easier to work with.
+
+```{r}
+drc %>%
+  pivot_longer(
+    cols=-Dose,
+    names_to="sample",
+    values_to="response"
+  ) %>%
+  filter(!is.na(response)) %>%
+  mutate(condition=str_sub(sample,1,1), replicate=as.numeric(str_sub(sample,2,2))) -> drc_tidy
+
+head(drc_tidy)
+
+```
+
+Plotting
+========
+
+All Data
+--------
+
+Let's look at the data.  I'm going to plot curves for each sample, so the ```group=sample``` will link the points which are to have a line connecting them.  We're colouring by condition so we can see the control and experiment groups.
+
+I'm making the x axis log scale rather than transforming the data itself.
+
+
+```{r}
+drc_tidy %>%
+  ggplot(aes(x=Dose, y=response, group=sample, colour=condition)) +
+  geom_line() +
+  geom_point() +
+  scale_x_log10()
+```
+
+OK they seem pretty decent.  We have different missing values in the different groups, but that shouldn't matter.
+
+Normalisation
+-------------
+
+There is a difference in scaling between the two conditions which we don't care about.  We care about the shape of the curves.  We'll therefore scale the values to the maximum observed value in each condition.  We're going to average the replicates for calculating this maximum value.
+
+First we want the maximum value seen for any dose in each condition.  I'll start by grouping and summarising to get the mean value per dose and condition.  Then I sort from high to low, group by condition and take the first value with slice, so I get the highest value in each condition.  I'm then renaming the response column to max_response.
+
+```{r}
+drc_tidy %>%
+  group_by(Dose, condition) %>%
+  summarise(response=mean(response)) %>%
+  arrange(desc(response)) %>%
+  group_by(condition) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(-Dose) %>%
+  rename(max_response=response) -> max_responses
+
+max_responses
+```
+
+We can now use these maximum values to normalise the rest of the data.
+
+I'll start by joining the maximum values tibble to the main data so that each row has the corresponding max value annotated against it.  I can then do a mutate to express the response as a percentage of the max value.
+
+```{r}
+drc_tidy %>%
+  left_join(max_responses) %>%
+  mutate(norm_response=100*response/max_response) %>%
+  select(Dose,sample, condition, replicate, norm_response) -> drc_norm
+
+head(drc_norm)
+```
+
+We can now replot using the normalised values.
+
+```{r}
+drc_norm %>%
+  ggplot(aes(x=Dose, y=norm_response, group=sample, colour=condition)) +
+  geom_line() +
+  geom_point() +
+  scale_x_log10()
+```
+
+Now the data are scaled more similarly and we don't see a difference in the maximum values between the two conditions.
+
+
+Averaging Conditions
+--------------------
+
+We can now average per condition to get a mean curve for Control and Experiment.  We do this by grouping on Dose and condition and then taking the mean response.  Whilst we're summarising we can also calculate the standard error of the mean for each point so we can add error bars later.
+
+```{r}
+drc_norm %>%
+  group_by(Dose, condition) %>%
+  summarise(
+    sem=sd(norm_response)/sqrt(n()),
+    response=mean(norm_response)
+  ) -> drc_per_condition
+```
+
+For the plot we plot Dose vs response, colouring by condition.  The min and max values for the errorbars are the response plus/minus the SEM values we calculated above.
+
+```{r}
+drc_per_condition %>%
+  ggplot(aes(x=Dose, y=response, ymin=response-sem, ymax=response+sem, colour=condition)) +
+  geom_line() +
+  geom_point() +
+  geom_errorbar(width=0.1) +
+  scale_x_log10()
+
+```
+
+We can clearly see the difference between the two curves.
+
+
+Curve Fitting
+=============
+
+Now we have the averaged normalised data we can fit a curve to it.  We'll use the ```drm``` package to do this.  We use a standard log logistic curve fit (```LL.4```) which will give us 4 parameters:
+
+1. The minimum of the curve
+2. The maximum of the curve
+3. The slope factor (Hill slope)
+4. The EC50 value
+
+You get short versions of these names by default so we're just adding an option to make them more readable.
+
+Our test is predicting the response from the Dose (```response~Dose```), and we'll make a curve for each condition (```curveid=condition```)
+
+```{r}
+drm(
+  data=drc_per_condition,
+  formula = response~Dose,
+  curveid = condition,
+  fct = LL.4(names = c("Hill slope", "Min", "Max", "EC50"))
+) -> model
+
+tidy(model)
+
+```
+
+As expected we can see that the min and max values are pretty identical between C and E (both 0 - 100).  It's only the curve and the EC50 which are potentially interesting.
+
+Let's look at the difference in the EC50.  We compare by subtraction rather than as a ratio.
+
+
+```{r}
+compParm(model,"EC50","-")
+```
+
+We can see that the difference in EC50 is highly significant between C and E.
+
+Checking curve fitting
+----------------------
+
+We can plot out the predicted curves and check that they fit the data well.
+
+We make theoretical curves by making the model predict values for all of the doses we originally measured.  It will do this for each of the conditions.
+
+We need to make a data frame (must be a data frame - a tibble doesn't work for some reason) with the doses and conditions we want to predict.
+
+```{r}
+data.frame(
+  dose=rep(drc$Dose,times=2),
+  condition=rep(c("C","E"),each=nrow(drc))
+) -> predicted_data
+
+predicted_data
+```
+
+We now get the model to predict the values for each of these conditions, and we add that as a new column.
+
+```{r}
+predict(model, newdata=predicted_data) -> predicted_data$prediction
+
+predicted_data
+```
+
+Plotting predicted data
+-----------------------
+
+Finally we can plot the predictions against the original data.  I'm using a ggplot in two parts.  The first plots the points of the original data, then for the second part we switch to the predicted data and plot the lines.
+
+
+```{r}
+drc_per_condition %>%
+  ggplot(aes(x=Dose, y=response, colour=condition)) +
+  geom_point() +
+  scale_x_log10() +
+  geom_line(
+    data=predicted_data,
+    aes(x=dose,y=prediction)
+  )
+```
+
+We can see that the predictions match the data very nicely, so we can have confidence in the EC50 values which were calculated.
+
+
+
+
+
